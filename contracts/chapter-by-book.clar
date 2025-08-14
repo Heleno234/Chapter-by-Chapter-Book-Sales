@@ -14,6 +14,9 @@
 (define-constant ERR-CHAPTER-ALREADY-EXISTS (err u108))
 (define-constant ERR-NOT-BOOK-OWNER (err u109))
 (define-constant ERR-INVALID-CHAPTER (err u110))
+(define-constant ERR-DISCOUNT-NOT-FOUND (err u111))
+(define-constant ERR-INVALID-DISCOUNT (err u112))
+(define-constant ERR-INSUFFICIENT-CHAPTERS (err u113))
 
 (define-data-var contract-owner principal tx-sender)
 (define-data-var total-books uint u0)
@@ -88,6 +91,15 @@
   }
 )
 
+(define-map bulk-discounts
+  { book-id: uint, min-chapters: uint }
+  {
+    discount-rate: uint,
+    created-at: uint,
+    active: bool
+  }
+)
+
 (define-read-only (get-book (book-id uint))
   (map-get? books { book-id: book-id })
 )
@@ -124,6 +136,37 @@
 
 (define-read-only (get-platform-fee-rate)
   (var-get platform-fee-rate)
+)
+
+(define-read-only (get-bulk-discount (book-id uint) (min-chapters uint))
+  (map-get? bulk-discounts { book-id: book-id, min-chapters: min-chapters })
+)
+
+(define-read-only (calculate-bulk-price (book-id uint) (chapter-count uint))
+  (let (
+    (book-data (unwrap! (get-book book-id) ERR-BOOK-NOT-FOUND))
+    (base-price (* (get price-per-chapter book-data) chapter-count))
+    (best-discount (fold find-best-discount (list u3 u5 u10 u20) { book-id: book-id, chapter-count: chapter-count, best-rate: u0 }))
+  )
+    (if (> (get best-rate best-discount) u0)
+      (ok (- base-price (/ (* base-price (get best-rate best-discount)) u10000)))
+      (ok base-price)
+    )
+  )
+)
+
+(define-private (find-best-discount (min-chapters uint) (state { book-id: uint, chapter-count: uint, best-rate: uint }))
+  (let ((discount-data (get-bulk-discount (get book-id state) min-chapters)))
+    (if (and 
+          (is-some discount-data)
+          (get active (unwrap-panic discount-data))
+          (>= (get chapter-count state) min-chapters)
+          (> (get discount-rate (unwrap-panic discount-data)) (get best-rate state))
+        )
+      (merge state { best-rate: (get discount-rate (unwrap-panic discount-data)) })
+      state
+    )
+  )
 )
 
 (define-public (create-book (title (string-ascii 100)) (description (string-ascii 500)) (cover-image (string-ascii 200)) (price-per-chapter uint))
@@ -308,5 +351,134 @@
     (asserts! (is-eq tx-sender (var-get contract-owner)) ERR-NOT-AUTHORIZED)
     (var-set contract-owner new-owner)
     (ok true)
+  )
+)
+
+(define-public (create-bulk-discount (book-id uint) (min-chapters uint) (discount-rate uint))
+  (let ((book-data (unwrap! (get-book book-id) ERR-BOOK-NOT-FOUND)))
+    (asserts! (is-eq (get author book-data) tx-sender) ERR-NOT-BOOK-OWNER)
+    (asserts! (>= min-chapters u3) ERR-INSUFFICIENT-CHAPTERS)
+    (asserts! (and (> discount-rate u0) (<= discount-rate u5000)) ERR-INVALID-DISCOUNT)
+    (asserts! (is-none (get-bulk-discount book-id min-chapters)) ERR-BOOK-ALREADY-EXISTS)
+    
+    (map-set bulk-discounts
+      { book-id: book-id, min-chapters: min-chapters }
+      {
+        discount-rate: discount-rate,
+        created-at: stacks-block-height,
+        active: true
+      }
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (update-bulk-discount (book-id uint) (min-chapters uint) (new-discount-rate uint))
+  (let ((book-data (unwrap! (get-book book-id) ERR-BOOK-NOT-FOUND)))
+    (asserts! (is-eq (get author book-data) tx-sender) ERR-NOT-BOOK-OWNER)
+    (asserts! (and (> new-discount-rate u0) (<= new-discount-rate u5000)) ERR-INVALID-DISCOUNT)
+    (asserts! (is-some (get-bulk-discount book-id min-chapters)) ERR-DISCOUNT-NOT-FOUND)
+    
+    (let ((current-discount (unwrap! (get-bulk-discount book-id min-chapters) ERR-DISCOUNT-NOT-FOUND)))
+      (map-set bulk-discounts
+        { book-id: book-id, min-chapters: min-chapters }
+        (merge current-discount { discount-rate: new-discount-rate })
+      )
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (toggle-bulk-discount (book-id uint) (min-chapters uint))
+  (let ((book-data (unwrap! (get-book book-id) ERR-BOOK-NOT-FOUND)))
+    (asserts! (is-eq (get author book-data) tx-sender) ERR-NOT-BOOK-OWNER)
+    (asserts! (is-some (get-bulk-discount book-id min-chapters)) ERR-DISCOUNT-NOT-FOUND)
+    
+    (let ((current-discount (unwrap! (get-bulk-discount book-id min-chapters) ERR-DISCOUNT-NOT-FOUND)))
+      (map-set bulk-discounts
+        { book-id: book-id, min-chapters: min-chapters }
+        (merge current-discount { active: (not (get active current-discount)) })
+      )
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (purchase-chapters-bulk (book-id uint) (chapter-numbers (list 20 uint)))
+  (let (
+    (book-data (unwrap! (get-book book-id) ERR-BOOK-NOT-FOUND))
+    (chapter-count (len chapter-numbers))
+    (discounted-price (unwrap! (calculate-bulk-price book-id chapter-count) ERR-BOOK-NOT-FOUND))
+    (platform-fee (/ (* discounted-price (var-get platform-fee-rate)) u10000))
+    (author-earnings (- discounted-price platform-fee))
+  )
+    (asserts! (get active book-data) ERR-NOT-AUTHORIZED)
+    (asserts! (>= chapter-count u3) ERR-INSUFFICIENT-CHAPTERS)
+    (asserts! (get valid (fold check-chapter-availability chapter-numbers { book-id: book-id, valid: true })) ERR-CHAPTER-NOT-FOUND)
+    
+    (try! (stx-transfer? discounted-price tx-sender (as-contract tx-sender)))
+    (try! (as-contract (stx-transfer? author-earnings tx-sender (get author book-data))))
+    (try! (as-contract (stx-transfer? platform-fee tx-sender (var-get contract-owner))))
+    
+    (fold process-bulk-purchase chapter-numbers book-id)
+    
+    (let ((current-earnings (get-book-earnings book-id)))
+      (map-set book-earnings
+        { book-id: book-id }
+        {
+          total-earned: (+ (get total-earned current-earnings) author-earnings),
+          chapters-sold: (+ (get chapters-sold current-earnings) chapter-count)
+        }
+      )
+    )
+    
+    (let ((current-stats (get-author-stats (get author book-data))))
+      (map-set author-stats
+        { author: (get author book-data) }
+        {
+          books-published: (get books-published current-stats),
+          total-earnings: (+ (get total-earnings current-stats) author-earnings),
+          total-sales: (+ (get total-sales current-stats) chapter-count)
+        }
+      )
+    )
+    
+    (let ((user-lib (default-to 
+          { chapters-owned: (list), total-spent: u0, first-purchase: stacks-block-height }
+          (get-user-library tx-sender book-id))))
+      (map-set user-libraries
+        { user: tx-sender, book-id: book-id }
+        {
+          chapters-owned: (unwrap! (as-max-len? (concat (get chapters-owned user-lib) chapter-numbers) u50) ERR-NOT-AUTHORIZED),
+          total-spent: (+ (get total-spent user-lib) discounted-price),
+          first-purchase: (get first-purchase user-lib)
+        }
+      )
+    )
+    
+    (ok discounted-price)
+  )
+)
+
+(define-private (check-chapter-availability (chapter-number uint) (state { book-id: uint, valid: bool }))
+  (let ((chapter-exists (is-some (get-chapter (get book-id state) chapter-number)))
+        (not-purchased (not (has-purchased-chapter tx-sender (get book-id state) chapter-number))))
+    (merge state { valid: (and (get valid state) chapter-exists not-purchased) })
+  )
+)
+
+(define-private (process-bulk-purchase (chapter-number uint) (book-id uint))
+  (begin
+    (map-set chapter-purchases
+      { buyer: tx-sender, book-id: book-id, chapter-number: chapter-number }
+      {
+        purchased-at: stacks-block-height,
+        price-paid: u0
+      }
+    )
+    book-id
   )
 )
