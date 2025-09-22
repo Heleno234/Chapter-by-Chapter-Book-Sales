@@ -17,6 +17,10 @@
 (define-constant ERR-DISCOUNT-NOT-FOUND (err u111))
 (define-constant ERR-INVALID-DISCOUNT (err u112))
 (define-constant ERR-INSUFFICIENT-CHAPTERS (err u113))
+(define-constant ERR-REVIEW-NOT-FOUND (err u114))
+(define-constant ERR-ALREADY-REVIEWED (err u115))
+(define-constant ERR-INSUFFICIENT-PURCHASE-HISTORY (err u116))
+(define-constant ERR-INVALID-RATING (err u117))
 
 (define-data-var contract-owner principal tx-sender)
 (define-data-var total-books uint u0)
@@ -100,6 +104,33 @@
   }
 )
 
+(define-map book-reviews
+  { reviewer: principal, book-id: uint }
+  {
+    rating: uint,
+    review-text: (string-ascii 500),
+    chapters-read: uint,
+    submitted-at: uint
+  }
+)
+
+(define-map book-ratings
+  { book-id: uint }
+  {
+    total-reviews: uint,
+    total-rating-points: uint,
+    average-rating: uint
+  }
+)
+
+(define-map reviewer-stats
+  { reviewer: principal }
+  {
+    total-reviews: uint,
+    books-reviewed: uint
+  }
+)
+
 (define-read-only (get-book (book-id uint))
   (map-get? books { book-id: book-id })
 )
@@ -140,6 +171,24 @@
 
 (define-read-only (get-bulk-discount (book-id uint) (min-chapters uint))
   (map-get? bulk-discounts { book-id: book-id, min-chapters: min-chapters })
+)
+
+(define-read-only (get-book-review (reviewer principal) (book-id uint))
+  (map-get? book-reviews { reviewer: reviewer, book-id: book-id })
+)
+
+(define-read-only (get-book-rating (book-id uint))
+  (default-to { total-reviews: u0, total-rating-points: u0, average-rating: u0 }
+    (map-get? book-ratings { book-id: book-id }))
+)
+
+(define-read-only (get-reviewer-stats (reviewer principal))
+  (default-to { total-reviews: u0, books-reviewed: u0 }
+    (map-get? reviewer-stats { reviewer: reviewer }))
+)
+
+(define-read-only (has-reviewed-book (reviewer principal) (book-id uint))
+  (is-some (map-get? book-reviews { reviewer: reviewer, book-id: book-id }))
 )
 
 (define-read-only (calculate-bulk-price (book-id uint) (chapter-count uint))
@@ -480,5 +529,98 @@
       }
     )
     book-id
+  )
+)
+
+(define-public (submit-review (book-id uint) (rating uint) (review-text (string-ascii 500)))
+  (let (
+    (book-data (unwrap! (get-book book-id) ERR-BOOK-NOT-FOUND))
+    (user-library (unwrap! (get-user-library tx-sender book-id) ERR-INSUFFICIENT-PURCHASE-HISTORY))
+    (chapters-owned-count (len (get chapters-owned user-library)))
+  )
+    (asserts! (>= rating u1) ERR-INVALID-RATING)
+    (asserts! (<= rating u5) ERR-INVALID-RATING)
+    (asserts! (>= chapters-owned-count u1) ERR-INSUFFICIENT-PURCHASE-HISTORY)
+    (asserts! (is-none (map-get? book-reviews { reviewer: tx-sender, book-id: book-id })) ERR-ALREADY-REVIEWED)
+    
+    (map-set book-reviews
+      { reviewer: tx-sender, book-id: book-id }
+      {
+        rating: rating,
+        review-text: review-text,
+        chapters-read: chapters-owned-count,
+        submitted-at: stacks-block-height
+      }
+    )
+    
+    (let ((current-ratings (default-to { total-reviews: u0, total-rating-points: u0, average-rating: u0 } (map-get? book-ratings { book-id: book-id }))))
+      (let (
+        (new-total-reviews (+ (get total-reviews current-ratings) u1))
+        (new-total-points (+ (get total-rating-points current-ratings) rating))
+        (new-average (/ (* new-total-points u100) new-total-reviews))
+      )
+        (map-set book-ratings
+          { book-id: book-id }
+          {
+            total-reviews: new-total-reviews,
+            total-rating-points: new-total-points,
+            average-rating: new-average
+          }
+        )
+      )
+    )
+    
+    (let ((current-reviewer-stats (default-to { total-reviews: u0, books-reviewed: u0 } (map-get? reviewer-stats { reviewer: tx-sender }))))
+      (map-set reviewer-stats
+        { reviewer: tx-sender }
+        {
+          total-reviews: (+ (get total-reviews current-reviewer-stats) u1),
+          books-reviewed: (+ (get books-reviewed current-reviewer-stats) u1)
+        }
+      )
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (update-review (book-id uint) (new-rating uint) (new-review-text (string-ascii 500)))
+  (let (
+    (book-data (unwrap! (get-book book-id) ERR-BOOK-NOT-FOUND))
+    (existing-review (unwrap! (map-get? book-reviews { reviewer: tx-sender, book-id: book-id }) ERR-REVIEW-NOT-FOUND))
+    (user-library (unwrap! (get-user-library tx-sender book-id) ERR-INSUFFICIENT-PURCHASE-HISTORY))
+    (chapters-owned-count (len (get chapters-owned user-library)))
+    (old-rating (get rating existing-review))
+  )
+    (asserts! (>= new-rating u1) ERR-INVALID-RATING)
+    (asserts! (<= new-rating u5) ERR-INVALID-RATING)
+    
+    (map-set book-reviews
+      { reviewer: tx-sender, book-id: book-id }
+      {
+        rating: new-rating,
+        review-text: new-review-text,
+        chapters-read: chapters-owned-count,
+        submitted-at: stacks-block-height
+      }
+    )
+    
+    (let ((current-ratings (unwrap! (map-get? book-ratings { book-id: book-id }) ERR-REVIEW-NOT-FOUND)))
+      (let (
+        (adjusted-total-points (+ (- (get total-rating-points current-ratings) old-rating) new-rating))
+        (new-average (/ (* adjusted-total-points u100) (get total-reviews current-ratings)))
+      )
+        (map-set book-ratings
+          { book-id: book-id }
+          {
+            total-reviews: (get total-reviews current-ratings),
+            total-rating-points: adjusted-total-points,
+            average-rating: new-average
+          }
+        )
+      )
+    )
+    
+    (ok true)
   )
 )
