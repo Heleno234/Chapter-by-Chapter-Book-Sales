@@ -21,6 +21,7 @@
 (define-constant ERR-ALREADY-REVIEWED (err u115))
 (define-constant ERR-INSUFFICIENT-PURCHASE-HISTORY (err u116))
 (define-constant ERR-INVALID-RATING (err u117))
+(define-constant ERR-INVALID-RECIPIENT (err u118))
 
 (define-data-var contract-owner principal tx-sender)
 (define-data-var total-books uint u0)
@@ -131,6 +132,15 @@
   }
 )
 
+(define-map gifted-chapters
+  { recipient: principal, book-id: uint, chapter-number: uint }
+  {
+    gifted-by: principal,
+    gifted-at: uint,
+    price-paid: uint
+  }
+)
+
 (define-read-only (get-book (book-id uint))
   (map-get? books { book-id: book-id })
 )
@@ -189,6 +199,17 @@
 
 (define-read-only (has-reviewed-book (reviewer principal) (book-id uint))
   (is-some (map-get? book-reviews { reviewer: reviewer, book-id: book-id }))
+)
+
+(define-read-only (get-gifted-chapter (recipient principal) (book-id uint) (chapter-number uint))
+  (map-get? gifted-chapters { recipient: recipient, book-id: book-id, chapter-number: chapter-number })
+)
+
+(define-read-only (has-access-to-chapter (user principal) (book-id uint) (chapter-number uint))
+  (or 
+    (has-purchased-chapter user book-id chapter-number)
+    (is-some (get-gifted-chapter user book-id chapter-number))
+  )
 )
 
 (define-read-only (calculate-bulk-price (book-id uint) (chapter-count uint))
@@ -618,6 +639,69 @@
             average-rating: new-average
           }
         )
+      )
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (gift-chapter (recipient principal) (book-id uint) (chapter-number uint))
+  (let (
+    (book-data (unwrap! (get-book book-id) ERR-BOOK-NOT-FOUND))
+    (chapter-data (unwrap! (get-chapter book-id chapter-number) ERR-CHAPTER-NOT-FOUND))
+    (price (get price-per-chapter book-data))
+    (platform-fee (/ (* price (var-get platform-fee-rate)) u10000))
+    (author-earnings (- price platform-fee))
+  )
+    (asserts! (get active book-data) ERR-NOT-AUTHORIZED)
+    (asserts! (not (is-eq tx-sender recipient)) ERR-INVALID-RECIPIENT)
+    (asserts! (not (has-access-to-chapter recipient book-id chapter-number)) ERR-ALREADY-PURCHASED)
+    
+    (try! (stx-transfer? price tx-sender (as-contract tx-sender)))
+    (try! (as-contract (stx-transfer? author-earnings tx-sender (get author book-data))))
+    (try! (as-contract (stx-transfer? platform-fee tx-sender (var-get contract-owner))))
+    
+    (map-set gifted-chapters
+      { recipient: recipient, book-id: book-id, chapter-number: chapter-number }
+      {
+        gifted-by: tx-sender,
+        gifted-at: stacks-block-height,
+        price-paid: price
+      }
+    )
+    
+    (let ((current-earnings (get-book-earnings book-id)))
+      (map-set book-earnings
+        { book-id: book-id }
+        {
+          total-earned: (+ (get total-earned current-earnings) author-earnings),
+          chapters-sold: (+ (get chapters-sold current-earnings) u1)
+        }
+      )
+    )
+    
+    (let ((current-stats (get-author-stats (get author book-data))))
+      (map-set author-stats
+        { author: (get author book-data) }
+        {
+          books-published: (get books-published current-stats),
+          total-earnings: (+ (get total-earnings current-stats) author-earnings),
+          total-sales: (+ (get total-sales current-stats) u1)
+        }
+      )
+    )
+    
+    (let ((user-lib (default-to 
+          { chapters-owned: (list), total-spent: u0, first-purchase: stacks-block-height }
+          (get-user-library recipient book-id))))
+      (map-set user-libraries
+        { user: recipient, book-id: book-id }
+        {
+          chapters-owned: (unwrap! (as-max-len? (append (get chapters-owned user-lib) chapter-number) u50) ERR-NOT-AUTHORIZED),
+          total-spent: (get total-spent user-lib),
+          first-purchase: (get first-purchase user-lib)
+        }
       )
     )
     
