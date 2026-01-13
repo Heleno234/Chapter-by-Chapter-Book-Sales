@@ -22,6 +22,8 @@
 (define-constant ERR-INSUFFICIENT-PURCHASE-HISTORY (err u116))
 (define-constant ERR-INVALID-RATING (err u117))
 (define-constant ERR-INVALID-RECIPIENT (err u118))
+(define-constant ERR-INVALID-TIP-AMOUNT (err u119))
+(define-constant ERR-CANNOT-TIP-SELF (err u120))
 
 (define-data-var contract-owner principal tx-sender)
 (define-data-var total-books uint u0)
@@ -141,6 +143,34 @@
   }
 )
 
+(define-map author-tips
+  { tipper: principal, author: principal, tip-id: uint }
+  {
+    amount: uint,
+    book-id: (optional uint),
+    message: (string-ascii 100),
+    tipped-at: uint
+  }
+)
+
+(define-map author-tip-totals
+  { author: principal }
+  {
+    total-tips-received: uint,
+    tip-count: uint
+  }
+)
+
+(define-map tipper-history
+  { tipper: principal }
+  {
+    total-tips-given: uint,
+    tip-count: uint
+  }
+)
+
+(define-data-var total-tips uint u0)
+
 (define-read-only (get-book (book-id uint))
   (map-get? books { book-id: book-id })
 )
@@ -210,6 +240,24 @@
     (has-purchased-chapter user book-id chapter-number)
     (is-some (get-gifted-chapter user book-id chapter-number))
   )
+)
+
+(define-read-only (get-author-tip-totals (author principal))
+  (default-to { total-tips-received: u0, tip-count: u0 }
+    (map-get? author-tip-totals { author: author }))
+)
+
+(define-read-only (get-tipper-history (tipper principal))
+  (default-to { total-tips-given: u0, tip-count: u0 }
+    (map-get? tipper-history { tipper: tipper }))
+)
+
+(define-read-only (get-tip (tipper principal) (author principal) (tip-id uint))
+  (map-get? author-tips { tipper: tipper, author: author, tip-id: tip-id })
+)
+
+(define-read-only (get-total-tips)
+  (var-get total-tips)
 )
 
 (define-read-only (calculate-bulk-price (book-id uint) (chapter-count uint))
@@ -706,5 +754,53 @@
     )
     
     (ok true)
+  )
+)
+
+(define-public (tip-author (author principal) (amount uint) (book-id (optional uint)) (message (string-ascii 100)))
+  (let (
+    (new-tip-id (+ (var-get total-tips) u1))
+    (author-current-tips (get-author-tip-totals author))
+    (tipper-current-history (get-tipper-history tx-sender))
+  )
+    (asserts! (> amount u0) ERR-INVALID-TIP-AMOUNT)
+    (asserts! (not (is-eq tx-sender author)) ERR-CANNOT-TIP-SELF)
+    
+    (match book-id
+      some-book-id (asserts! (is-some (get-book some-book-id)) ERR-BOOK-NOT-FOUND)
+      true
+    )
+    
+    (try! (stx-transfer? amount tx-sender author))
+    
+    (map-set author-tips
+      { tipper: tx-sender, author: author, tip-id: new-tip-id }
+      {
+        amount: amount,
+        book-id: book-id,
+        message: message,
+        tipped-at: stacks-block-height
+      }
+    )
+    
+    (map-set author-tip-totals
+      { author: author }
+      {
+        total-tips-received: (+ (get total-tips-received author-current-tips) amount),
+        tip-count: (+ (get tip-count author-current-tips) u1)
+      }
+    )
+    
+    (map-set tipper-history
+      { tipper: tx-sender }
+      {
+        total-tips-given: (+ (get total-tips-given tipper-current-history) amount),
+        tip-count: (+ (get tip-count tipper-current-history) u1)
+      }
+    )
+    
+    (var-set total-tips new-tip-id)
+    
+    (ok new-tip-id)
   )
 )
